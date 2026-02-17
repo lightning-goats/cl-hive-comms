@@ -1,0 +1,22 @@
+name: Scaffold CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  scaffold-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Required files exist
+        run: |
+          test -f README.md
+          test -f docs/ROADMAP.md
+
+      - name: Planning-only marker exists
+        run: |
+          grep -qi "planning-only" README.md
