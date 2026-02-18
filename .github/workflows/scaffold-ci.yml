@@ -6,17 +6,35 @@ on:
   pull_request:
 
 jobs:
-  scaffold-checks:
+  python-checks:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Required files exist
         run: |
           test -f README.md
           test -f docs/ROADMAP.md
+          test -f cl-hive-comms.py
+          test -f modules/comms_service.py
+          test -f tests/test_comms_service.py
+          test -f requirements.txt
 
-      - name: Planning-only marker exists
+      - name: Install dependencies
         run: |
-          grep -qi "planning-only" README.md
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Static syntax check
+        run: |
+          python -m compileall cl-hive-comms.py modules tests
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests -q
