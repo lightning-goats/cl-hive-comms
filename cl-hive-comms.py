@@ -358,6 +358,12 @@ def hive_comms_nostr_event(plugin: Plugin, event: Any, sender_pubkey: str = "") 
     )
 
 
+@plugin.method("hive-client-prune")
+def hive_client_prune(plugin: Plugin, days: int = 90) -> Dict[str, Any]:
+    del plugin
+    return _require_service().prune(days=_parse_int(days, 90))
+
+
 @plugin.method("hive-comms-register-transport")
 def hive_comms_register_transport(
     plugin: Plugin,

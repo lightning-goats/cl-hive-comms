@@ -548,6 +548,15 @@ class CommsStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def sum_payments_today(self, advisor_id: str, now_ts: int) -> int:
+        conn = self._get_connection()
+        day_start = now_ts - 86400
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount_sats), 0) AS total FROM comms_payments WHERE advisor_id = ? AND created_at >= ?",
+            (advisor_id, day_start),
+        ).fetchone()
+        return int(row["total"] or 0)
+
     def summarize_payments(self, now_ts: int) -> Dict[str, int]:
         conn = self._get_connection()
         day_cutoff = now_ts - 86400
@@ -685,6 +694,38 @@ class CommsStore:
         conn = self._get_connection()
         row = conn.execute("SELECT COUNT(*) AS cnt FROM management_receipts").fetchone()
         return int(row["cnt"] or 0)
+
+    def prune_old_data(self, days: int = 90, now_ts: int = 0) -> Dict[str, int]:
+        conn = self._get_connection()
+        if now_ts <= 0:
+            now_ts = _now_ts(time.time)
+        cutoff = now_ts - (days * 86400)
+        pruned: Dict[str, int] = {}
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "DELETE FROM management_receipts WHERE created_at < ?", (cutoff,)
+            )
+            pruned["receipts"] = cursor.rowcount
+            cursor = conn.execute(
+                "DELETE FROM comms_payments WHERE created_at < ?", (cutoff,)
+            )
+            pruned["payments"] = cursor.rowcount
+            cursor = conn.execute(
+                "DELETE FROM comms_trials WHERE status IN ('expired', 'stopped') AND ends_at < ?",
+                (cutoff,),
+            )
+            pruned["trials"] = cursor.rowcount
+            cursor = conn.execute(
+                "DELETE FROM nostr_state WHERE key LIKE 'replay:%' AND updated_at < ?",
+                (cutoff,),
+            )
+            pruned["replay_nonces"] = cursor.rowcount
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return pruned
 
 
 class PolicyEngine:
@@ -851,11 +892,14 @@ class CommsService:
         return _now_ts(self._time_fn)
 
     def _create_local_identity(self) -> Dict[str, str]:
+        # NOTE: This generates a placeholder identity — the pubkey is SHA256(privkey)
+        # rather than a proper secp256k1 x-only derivation. This is intentional for
+        # dark-launch (local-only wire format). Must be replaced with real Nostr
+        # keygen before publishing to external relays. See ROADMAP.md item 1.
         privkey = secrets.token_hex(32)
         digest = _sha256_hex(privkey)
-        # Nostr uses x-only 32-byte pubkeys.
         pubkey = digest[:64]
-        return {"privkey": privkey, "pubkey": pubkey}
+        return {"privkey": privkey, "pubkey": pubkey, "placeholder": True}
 
     def _bootstrap_identity_if_needed(self) -> None:
         now_ts = self._now()
@@ -866,7 +910,8 @@ class CommsService:
             identity = self._create_local_identity()
             self.store.set_nostr_state("config:privkey", identity["privkey"], now_ts)
             self.store.set_nostr_state("config:pubkey", identity["pubkey"], now_ts)
-            self._log("comms: generated local Nostr identity", "info")
+            self.store.set_nostr_state("config:identity_placeholder", "true", now_ts)
+            self._log("comms: generated placeholder Nostr identity (not valid for external relay publishing)", "warn")
         elif _is_hex_len(pubkey, 66) and pubkey[:2] in ("02", "03"):
             # Migrate old compressed-style placeholder key to x-only form.
             self.store.set_nostr_state("config:pubkey", pubkey[2:], now_ts)
@@ -949,22 +994,26 @@ class CommsService:
 
         if action in ("get", "status", "show"):
             pubkey = self.store.get_nostr_state("config:pubkey") or ""
+            is_placeholder = self.store.get_nostr_state("config:identity_placeholder") == "true"
             return {
                 "ok": True,
                 "pubkey": pubkey,
                 "relays": self._get_relays(),
                 "has_private_key": bool(self.store.get_nostr_state("config:privkey")),
+                "placeholder_keygen": is_placeholder,
             }
 
         if action == "rotate":
             identity = self._create_local_identity()
             self.store.set_nostr_state("config:privkey", identity["privkey"], now_ts)
             self.store.set_nostr_state("config:pubkey", identity["pubkey"], now_ts)
+            self.store.set_nostr_state("config:identity_placeholder", "true", now_ts)
             return {
                 "ok": True,
                 "rotated": True,
                 "pubkey": identity["pubkey"],
                 "relays": self._get_relays(),
+                "placeholder_keygen": True,
             }
 
         if action == "import":
@@ -978,6 +1027,7 @@ class CommsService:
             pubkey = digest[:64]
             self.store.set_nostr_state("config:privkey", key, now_ts)
             self.store.set_nostr_state("config:pubkey", pubkey, now_ts)
+            self.store.set_nostr_state("config:identity_placeholder", "false", now_ts)
             return {"ok": True, "imported": True, "pubkey": pubkey, "relays": self._get_relays()}
 
         if action == "set-relays":
@@ -1185,6 +1235,16 @@ class CommsService:
             if not row:
                 return {"error": "advisor not found"}
             advisor_id = str(row.get("advisor_id") or "")
+            daily_limit = int(row.get("daily_limit_sats") or 0)
+            if daily_limit > 0:
+                spent_today = self.store.sum_payments_today(advisor_id, now_ts)
+                if spent_today + amount_sats > daily_limit:
+                    return {
+                        "error": "daily limit exceeded",
+                        "daily_limit_sats": daily_limit,
+                        "spent_today_sats": spent_today,
+                        "requested_sats": amount_sats,
+                    }
             payment_id = _sha256_hex(f"{advisor_id}:{method}:{amount_sats}:{now_ts}:{uuid.uuid4()}")[:32]
             self.store.add_payment(
                 payment_id=payment_id,
@@ -1330,6 +1390,14 @@ class CommsService:
             return {"ok": True, "removed": removed}
 
         return {"error": "invalid action", "valid_actions": ["list", "set", "get", "remove"]}
+
+    def prune(self, days: int = 90) -> Dict[str, Any]:
+        if not isinstance(days, int) or days < 1:
+            return {"error": "days must be a positive integer"}
+        if days > 365:
+            days = 365
+        pruned = self.store.prune_old_data(days=days, now_ts=self._now())
+        return {"ok": True, "days": days, "pruned": pruned}
 
     def execute_schema(self, schema_type: str, schema_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a transport-delivered schema payload to local handlers."""

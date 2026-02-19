@@ -168,3 +168,62 @@ def test_status_aggregates(tmp_path):
     assert status["active_advisors"] == 1
     assert status["payments"]["total_sats"] == 500
     assert "pubkey" in status["identity"]
+
+
+def test_daily_limit_enforced(tmp_path):
+    service = _make_service(tmp_path)
+    service.authorize("Hex Advisor", daily_limit_sats=1000)
+
+    rec1 = service.payments(action="record", advisor="Hex Advisor", amount_sats=800, kind="bolt11")
+    assert rec1["ok"] is True
+
+    rec2 = service.payments(action="record", advisor="Hex Advisor", amount_sats=300, kind="bolt11")
+    assert "error" in rec2
+    assert rec2["error"] == "daily limit exceeded"
+    assert rec2["daily_limit_sats"] == 1000
+    assert rec2["spent_today_sats"] == 800
+
+
+def test_daily_limit_zero_means_unlimited(tmp_path):
+    service = _make_service(tmp_path)
+    service.authorize("Hex Advisor", daily_limit_sats=0)
+
+    rec = service.payments(action="record", advisor="Hex Advisor", amount_sats=999999, kind="bolt11")
+    assert rec["ok"] is True
+
+
+def test_placeholder_identity_flagged(tmp_path):
+    service = _make_service(tmp_path)
+    identity = service.identity()
+    assert identity["ok"] is True
+    assert identity["placeholder_keygen"] is True
+
+
+def test_imported_identity_clears_placeholder(tmp_path):
+    service = _make_service(tmp_path)
+    # Start with placeholder
+    assert service.identity()["placeholder_keygen"] is True
+
+    # Import a real key
+    real_key = "a" * 64
+    result = service.identity(action="import", nsec=real_key)
+    assert result["ok"] is True
+
+    # Placeholder flag should be cleared
+    identity = service.identity()
+    assert identity["placeholder_keygen"] is False
+
+
+def test_prune_removes_old_data(tmp_path):
+    now = [time.time()]
+    service = _make_service(tmp_path, time_fn=lambda: now[0])
+    service.authorize("Hex Advisor")
+    service.payments(action="record", advisor="Hex Advisor", amount_sats=100, kind="bolt11")
+
+    # Age the data by 100 days
+    now[0] += 100 * 86400
+
+    result = service.prune(days=90)
+    assert result["ok"] is True
+    assert result["pruned"]["receipts"] >= 1
+    assert result["pruned"]["payments"] >= 1

@@ -115,6 +115,7 @@ class TransportRouter:
         self.max_clock_skew_seconds = max(1, int(max_clock_skew_seconds))
         self.replay_guard = ReplayGuard(store=store)
         self.rate_limiter = RateLimiter(max_per_window=60, window_seconds=60)
+        self.high_danger_limiter = RateLimiter(max_per_window=5, window_seconds=60)
         self._registry_lock = threading.Lock()
         self._seed_builtin_transports()
 
@@ -405,6 +406,8 @@ class TransportRouter:
             return {"error": "replay rejected: nonce not monotonic", "transport": transport_name}
 
         danger = self._danger_for_schema(schema_type, schema_payload)
+        if danger >= 5 and not self.high_danger_limiter.check(sender_id, float(now_ts)):
+            return {"error": "rate limit exceeded for high-danger operation", "transport": transport_name}
         policy = self.service.policy_engine.evaluate(schema_id=schema_type, danger_score=danger)
         if not policy.get("allowed", False):
             return {"error": policy.get("reason") or "blocked by policy", "transport": transport_name}
