@@ -62,7 +62,7 @@ class CommsStore:
         if conn is None:
             db_dir = os.path.dirname(self.db_path)
             if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
+                os.makedirs(db_dir, mode=0o700, exist_ok=True)
             conn = sqlite3.connect(
                 self.db_path,
                 isolation_level=None,
@@ -77,6 +77,10 @@ class CommsStore:
             except OSError:
                 pass
         return conn
+
+    def get_connection(self) -> "sqlite3.Connection":
+        """Public accessor for thread-local DB connection (used by ReplayGuard)."""
+        return self._get_connection()
 
     def close(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -393,6 +397,10 @@ class CommsStore:
             """,
             (advisor_id, auth_token, created_at, now_ts),
         )
+
+    def delete_advisor_auth_token(self, advisor_id: str) -> None:
+        conn = self._get_connection()
+        conn.execute("DELETE FROM comms_advisor_auth WHERE advisor_id = ?", (advisor_id,))
 
     def get_alias(self, alias: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -940,11 +948,13 @@ class CommsService:
             return None
         return self.store.get_advisor(reference.strip())
 
+    VALID_PERMISSIONS = {"monitor", "admin", "policy", "payments", "payment", "fee_policy", "trial", "alias"}
+
     def _to_permissions(self, access: str) -> List[str]:
         if not isinstance(access, str):
             return ["monitor"]
         items = [item.strip() for item in access.split(",")]
-        cleaned = [item for item in items if item]
+        cleaned = [item for item in items if item and item in self.VALID_PERMISSIONS]
         return cleaned or ["monitor"]
 
     def _to_int(self, value: Any, default: int) -> int:
@@ -1078,12 +1088,13 @@ class CommsService:
             "daily_limit_sats": max(0, int(daily_limit_sats)),
             "auth_token": auth_token,
         }
+        receipt_result = {k: v for k, v in result.items() if k != "auth_token"}
         receipt = self._record_receipt(
             actor=advisor_id,
             schema_id="hive:authorize/v1",
             action="authorize",
             params={"access": permissions, "daily_limit_sats": max(0, int(daily_limit_sats))},
-            result=result,
+            result=receipt_result,
         )
         result["receipt_id"] = receipt["receipt_id"]
         return result
@@ -1102,6 +1113,7 @@ class CommsService:
             note=str(reason or row.get("note") or ""),
             now_ts=self._now(),
         )
+        self.store.delete_advisor_auth_token(advisor_id)
         result = {
             "ok": True,
             "advisor_id": advisor_id,

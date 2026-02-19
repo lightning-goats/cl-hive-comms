@@ -24,7 +24,7 @@ class ReplayGuard:
 
     def validate_and_update(self, sender: str, nonce: int, now_ts: int) -> bool:
         key = f"{self.KEY_PREFIX}{sender}"
-        conn = self.store._get_connection()
+        conn = self.store.get_connection()
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
@@ -50,7 +50,7 @@ class ReplayGuard:
             raise
 
     def cleanup_stale(self, max_age_seconds: int = 86400, now_ts: int = 0) -> int:
-        conn = self.store._get_connection()
+        conn = self.store.get_connection()
         cursor = conn.execute(
             "DELETE FROM nostr_state WHERE key LIKE 'replay:%' AND updated_at < ?",
             (now_ts - max_age_seconds,),
@@ -237,7 +237,8 @@ class TransportRouter:
             if action == "stop":
                 return 3
             return 2
-        return 6
+        # Unknown schemas get high danger score to require explicit policy allowance
+        return 9
 
     def _validate_message(self, message: Dict[str, Any]) -> Optional[str]:
         if not isinstance(message, dict):
@@ -402,9 +403,6 @@ class TransportRouter:
         if not self._check_schema_permission(schema_type, permissions):
             return {"error": "insufficient permissions for schema", "transport": transport_name}
 
-        if not self.replay_guard.validate_and_update(sender_id, nonce, now_ts):
-            return {"error": "replay rejected: nonce not monotonic", "transport": transport_name}
-
         danger = self._danger_for_schema(schema_type, schema_payload)
         if danger >= 5 and not self.high_danger_limiter.check(sender_id, float(now_ts)):
             return {"error": "rate limit exceeded for high-danger operation", "transport": transport_name}
@@ -417,6 +415,10 @@ class TransportRouter:
                 "requires_confirmation": True,
                 "transport": transport_name,
             }
+
+        # Consume nonce only after policy evaluation passes (avoids burning nonces on rejected requests)
+        if not self.replay_guard.validate_and_update(sender_id, nonce, now_ts):
+            return {"error": "replay rejected: nonce not monotonic", "transport": transport_name}
 
         result = self.service.execute_schema(schema_type=schema_type, schema_payload=schema_payload)
         if isinstance(result, dict) and "error" in result:
