@@ -1,8 +1,10 @@
 """Unit tests for cl-hive-comms core service."""
 
+import base64
 import os
 import sys
 import time
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -227,3 +229,72 @@ def test_prune_removes_old_data(tmp_path):
     assert result["ok"] is True
     assert result["pruned"]["receipts"] >= 1
     assert result["pruned"]["payments"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# NostrTransport receive_dm / process_inbound tests (Phase 6 Handover)
+# ---------------------------------------------------------------------------
+
+from modules.nostr_transport import NostrTransport
+
+
+def _make_transport():
+    """Create a NostrTransport with mock plugin and db."""
+    plugin = MagicMock()
+    plugin.log = MagicMock()
+    db = MagicMock()
+    db.set_nostr_state = MagicMock()
+    return NostrTransport(plugin, db, privkey_hex="aa" * 32)
+
+
+def test_nostr_transport_receive_dm_callback():
+    """Verify receive_dm registers callback and process_inbound dispatches to it."""
+    transport = _make_transport()
+
+    received = []
+    transport.receive_dm(lambda env: received.append(env))
+
+    # Inject a kind-4 DM event with b64-encoded content
+    plaintext = "hello from test"
+    encoded = "b64:" + base64.b64encode(plaintext.encode()).decode()
+    dm_event = {
+        "kind": 4,
+        "pubkey": "sender_abc",
+        "content": encoded,
+        "created_at": int(time.time()),
+    }
+    transport.inject_event(dm_event)
+
+    count = transport.process_inbound()
+    assert count == 1
+    assert len(received) == 1
+    assert received[0]["plaintext"] == plaintext
+    assert received[0]["pubkey"] == "sender_abc"
+
+
+def test_nostr_transport_subscription_dispatch():
+    """Verify subscription callbacks fire for matching events."""
+    transport = _make_transport()
+
+    matched = []
+    transport.subscribe({"kinds": [1]}, lambda ev: matched.append(ev))
+
+    transport.inject_event({"kind": 1, "content": "yes"})
+    transport.inject_event({"kind": 4, "content": "no"})
+
+    transport.process_inbound()
+    assert len(matched) == 1
+    assert matched[0]["content"] == "yes"
+
+
+def test_nostr_transport_decode_dm_plain():
+    """Non-b64 content should be returned as-is."""
+    transport = _make_transport()
+    assert transport._decode_dm("plain text") == "plain text"
+
+
+def test_nostr_transport_decode_dm_b64():
+    """b64-prefixed content should be decoded."""
+    transport = _make_transport()
+    encoded = "b64:" + base64.b64encode(b"secret").decode()
+    assert transport._decode_dm(encoded) == "secret"
