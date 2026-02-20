@@ -164,10 +164,16 @@ def _inbound_loop() -> None:
     while True:
         try:
             if nostr_transport:
+                if nostr_transport._stop_event.is_set():
+                    break
                 nostr_transport.process_inbound()
         except Exception as e:
             _logger(f"Inbound loop error: {e}", "warn")
-        time.sleep(0.1)
+        try:
+            if nostr_transport and nostr_transport._stop_event.wait(0.1):
+                break
+        except Exception:
+            time.sleep(0.1)
 
 
 @plugin.init()

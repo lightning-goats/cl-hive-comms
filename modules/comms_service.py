@@ -1107,8 +1107,13 @@ class CommsService:
                     "error": "invalid nsec format",
                     "hint": "expected 64-char hex private key for current dark-launch mode",
                 }
-            digest = _sha256_hex(key)
-            pubkey = digest[:64]
+            try:
+                priv_val = int(key, 16)
+                private_key = ec.derive_private_key(priv_val, ec.SECP256K1())
+                public_nums = private_key.public_key().public_numbers()
+                pubkey = format(public_nums.x, "064x")
+            except Exception:
+                return {"error": "invalid private key: secp256k1 derivation failed"}
             self.store.set_nostr_state("config:privkey", key, now_ts)
             self.store.set_nostr_state("config:pubkey", pubkey, now_ts)
             self.store.set_nostr_state("config:identity_placeholder", "false", now_ts)

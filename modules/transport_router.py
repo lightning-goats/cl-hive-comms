@@ -8,7 +8,7 @@ import threading
 import time
 import hashlib
 import hmac
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from modules.comms_service import CommsService, CommsStore
 from modules.transport_security import NostrDmCodec, RuneVerifier

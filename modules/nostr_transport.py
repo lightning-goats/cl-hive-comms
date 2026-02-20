@@ -21,7 +21,6 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization, hashes
 
 try:
     from coincurve import PrivateKey as CoincurvePrivateKey
