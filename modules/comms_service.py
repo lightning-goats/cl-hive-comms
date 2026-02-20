@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -12,6 +13,14 @@ import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
+
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
+from nacl.secret import SecretBox
+from nacl.utils import random as nacl_random
+
+# Secp256k1 curve order for key negation (BIP-340)
+_SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
 def _sha256_hex(value: str) -> str:
@@ -45,13 +54,66 @@ def _parse_json_object(raw: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+class SecretManager:
+    """Manages at-rest encryption for sensitive fields."""
+
+    def __init__(self, secrets_path: str):
+        self.secrets_path = secrets_path
+        self._box: Optional[SecretBox] = None
+        self._load_or_create_key()
+
+    def _load_or_create_key(self) -> None:
+        if os.path.exists(self.secrets_path):
+            with open(self.secrets_path, "rb") as f:
+                key = f.read()
+        else:
+            key = nacl_random(32)
+            os.makedirs(os.path.dirname(self.secrets_path), mode=0o700, exist_ok=True)
+            with open(self.secrets_path, "wb") as f:
+                f.write(key)
+            os.chmod(self.secrets_path, 0o400)
+        
+        if len(key) != 32:
+            raise ValueError(f"invalid secret key length in {self.secrets_path}")
+        self._box = SecretBox(key)
+
+    def encrypt(self, plaintext: str) -> str:
+        if not self._box:
+            raise RuntimeError("SecretManager not initialized")
+        encrypted = self._box.encrypt(plaintext.encode("utf-8"))
+        return base64.b64encode(encrypted).decode("ascii")
+
+    def decrypt(self, ciphertext: str) -> str:
+        if not self._box:
+            raise RuntimeError("SecretManager not initialized")
+        try:
+            raw = base64.b64decode(ciphertext)
+            decrypted = self._box.decrypt(raw)
+            return decrypted.decode("utf-8")
+        except Exception:
+            # If decryption fails (e.g. legacy plaintext data), return as-is or raise
+            # For backward compatibility during migration, we might return the input
+            # if it looks like hex/plaintext, but secure default is to fail.
+            # Here we assume all data accessed via this method IS encrypted.
+            raise ValueError("decryption failed")
+
+    def decrypt_optional(self, ciphertext: str) -> str:
+        """Decrypts if possible, otherwise returns original (migration helper)."""
+        try:
+            return self.decrypt(ciphertext)
+        except (ValueError, TypeError, base64.binascii.Error):
+            return ciphertext
+
+
 class CommsStore:
     """SQLite persistence for cl-hive-comms local state."""
 
     def __init__(self, db_path: str, logger: Optional[Callable[[str, str], None]] = None):
         self.db_path = os.path.expanduser(db_path)
+        self.secrets_path = os.path.join(os.path.dirname(self.db_path), "comms.secrets")
         self._logger = logger
         self._local = threading.local()
+        self.secrets = SecretManager(self.secrets_path)
 
     def _log(self, message: str, level: str = "info") -> None:
         if self._logger:
@@ -212,9 +274,14 @@ class CommsStore:
             "SELECT value FROM nostr_state WHERE key = ?",
             (key,),
         ).fetchone()
-        return str(row["value"]) if row else None
+        val = str(row["value"]) if row else None
+        if val and key == "config:privkey":
+            return self.secrets.decrypt_optional(val)
+        return val
 
     def set_nostr_state(self, key: str, value: str, now_ts: int) -> None:
+        if key == "config:privkey":
+            value = self.secrets.encrypt(value)
         conn = self._get_connection()
         conn.execute(
             """
@@ -286,16 +353,16 @@ class CommsStore:
 
     def get_advisor(self, reference: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
-        row = conn.execute(
-            """
-            SELECT * FROM comms_advisors
-            WHERE advisor_id = ? OR advisor_ref = ? OR alias = ?
-            LIMIT 1
-            """,
-            (reference, reference, reference),
-        ).fetchone()
-        if row:
-            return dict(row)
+        # Priority order: exact advisor_id > exact advisor_ref > inline alias
+        # This prevents ambiguous multi-match scenarios.
+        for column in ("advisor_id", "advisor_ref", "alias"):
+            row = conn.execute(
+                f"SELECT * FROM comms_advisors WHERE {column} = ? LIMIT 1",
+                (reference,),
+            ).fetchone()
+            if row:
+                return dict(row)
+        # Fall back to alias table join
         alias_row = conn.execute(
             """
             SELECT a.*
@@ -378,9 +445,11 @@ class CommsStore:
             "SELECT auth_token FROM comms_advisor_auth WHERE advisor_id = ?",
             (advisor_id,),
         ).fetchone()
-        return str(row["auth_token"]) if row else None
+        val = str(row["auth_token"]) if row else None
+        return self.secrets.decrypt_optional(val) if val else None
 
     def upsert_advisor_auth_token(self, advisor_id: str, auth_token: str, now_ts: int) -> None:
+        encrypted_token = self.secrets.encrypt(auth_token)
         conn = self._get_connection()
         existing = conn.execute(
             "SELECT created_at FROM comms_advisor_auth WHERE advisor_id = ?",
@@ -395,7 +464,7 @@ class CommsStore:
                 auth_token = excluded.auth_token,
                 updated_at = excluded.updated_at
             """,
-            (advisor_id, auth_token, created_at, now_ts),
+            (advisor_id, encrypted_token, created_at, now_ts),
         )
 
     def delete_advisor_auth_token(self, advisor_id: str) -> None:
@@ -900,14 +969,19 @@ class CommsService:
         return _now_ts(self._time_fn)
 
     def _create_local_identity(self) -> Dict[str, str]:
-        # NOTE: This generates a placeholder identity — the pubkey is SHA256(privkey)
-        # rather than a proper secp256k1 x-only derivation. This is intentional for
-        # dark-launch (local-only wire format). Must be replaced with real Nostr
-        # keygen before publishing to external relays. See ROADMAP.md item 1.
-        privkey = secrets.token_hex(32)
-        digest = _sha256_hex(privkey)
-        pubkey = digest[:64]
-        return {"privkey": privkey, "pubkey": pubkey, "placeholder": True}
+        # Generate a secure secp256k1 private key
+        private_key = ec.generate_private_key(ec.SECP256K1())
+        private_val = private_key.private_numbers().private_value
+        public_nums = private_key.public_key().public_numbers()
+
+        # Enforce even Y coordinate (BIP-340 / Nostr)
+        if public_nums.y % 2 != 0:
+            private_val = _SECP256K1_ORDER - private_val
+
+        privkey_hex = format(private_val, "064x")
+        pubkey_hex = format(public_nums.x, "064x")
+        
+        return {"privkey": privkey_hex, "pubkey": pubkey_hex, "placeholder": False}
 
     def _bootstrap_identity_if_needed(self) -> None:
         now_ts = self._now()

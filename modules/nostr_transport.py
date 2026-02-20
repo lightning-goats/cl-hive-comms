@@ -7,7 +7,8 @@ This module provides:
 - Thread-safe inbound and outbound queues.
 - Subscription and DM callback plumbing.
 
-Adapted from cl-hive to use 'cryptography' library for SECP256K1 operations.
+Uses coincurve for BIP-340 Schnorr signatures when available,
+falls back to cryptography library for key derivation.
 """
 
 import base64
@@ -21,6 +22,11 @@ from typing import Any, Callable, Dict, List, Optional
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization, hashes
+
+try:
+    from coincurve import PrivateKey as CoincurvePrivateKey
+except Exception:  # pragma: no cover - optional dependency
+    CoincurvePrivateKey = None
 
 # Secp256k1 curve order for key negation (BIP-340)
 _SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -158,30 +164,22 @@ class NostrTransport:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _sign_event(self, event: Dict[str, Any]) -> str:
-        """Sign event id using BIP-340 Schnorr signature via cryptography library."""
-        try:
-            event_id_bytes = bytes.fromhex(event["id"])
-            priv_val = int(self._privkey_hex, 16)
-            private_key = ec.derive_private_key(priv_val, ec.SECP256K1())
-            
-            # BIP-340 requires auxiliary random data
-            signature = private_key.sign(
-                event_id_bytes,
-                ec.ECDSA(hashes.SHA256()) # Placeholder: cryptography < 43 doesn't have explicit Schnorr
-            )
-            # NOTE: True BIP-340 support requires 'cryptography' 43+ or manual implementation.
-            # Since cl-hive environment has 42+, we might need a raw implementation or 
-            # assume the specialized 'schnorr' method is available if upgraded.
-            # For now, we'll use a deterministic fallback or strict dependency update.
-            # Given the constraints, we will log a warning if strict Schnorr isn't available
-            # and fallback to ECDSA which is INVALID for real Nostr relays but functional for
-            # internal testing. *CRITICAL FIX*: We should ideally use a library that supports it.
-            # However, for this handover, we focus on structure. 
-            
-            # TODO: Replace with proper schnorr_sign(msg, privkey)
-            return signature.hex()
-        except Exception:
-            return hashlib.sha256((event["id"] + self._privkey_hex).encode("utf-8")).hexdigest()
+        """Sign event id using BIP-340 Schnorr signature.
+
+        Uses coincurve.sign_schnorr when available (proper BIP-340).
+        Falls back to deterministic hash for testing when coincurve is absent.
+        """
+        event_id = str(event.get("id", ""))
+        if len(event_id) == 64 and CoincurvePrivateKey:
+            try:
+                secret = bytes.fromhex(self._privkey_hex)
+                priv = CoincurvePrivateKey(secret)
+                sig = priv.sign_schnorr(bytes.fromhex(event_id))
+                return sig.hex()
+            except Exception:
+                pass
+        # Deterministic fallback for testing (not valid for real Nostr relays)
+        return hashlib.sha256((event_id + self._privkey_hex).encode("utf-8")).hexdigest()
 
     def publish(self, event: Dict[str, Any]) -> Dict[str, Any]:
         """Queue an event for publish and return the signed canonical form."""

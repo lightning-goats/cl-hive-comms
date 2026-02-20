@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
 from typing import Any, Dict
 
 from pyln.client import Plugin
@@ -12,10 +14,12 @@ from pyln.client import Plugin
 from modules.comms_service import CommsService, CommsStore
 from modules.transport_security import NostrDmCodec, RuneVerifier
 from modules.transport_router import TransportRouter
+from modules.nostr_transport import NostrTransport
 
 plugin = Plugin()
 service: CommsService | None = None
 router: TransportRouter | None = None
+nostr_transport: NostrTransport | None = None
 
 
 plugin.add_option(
@@ -106,6 +110,66 @@ def _parse_json_object(value: Any) -> Dict[str, Any] | None:
     return None
 
 
+def _handle_inbound_dm(envelope: Dict[str, Any]) -> None:
+    """Handle incoming DM: route locally or forward to cl-hive."""
+    try:
+        plaintext = envelope.get("plaintext", "")
+        if not plaintext:
+            return
+        
+        # Try parsing as JSON
+        try:
+            payload = json.loads(plaintext)
+        except json.JSONDecodeError:
+            # Not JSON, ignore or forward raw? 
+            # Hive protocol might be binary wrapped in base64? 
+            # For now assume JSON as per spec.
+            return
+
+        if not isinstance(payload, dict):
+            return
+
+        sender = envelope.get("pubkey")
+
+        # 1. Check if it's a management schema (local processing)
+        if "schema_type" in payload:
+            _require_router().handle_message(
+                sender=sender,
+                message=payload,
+                transport="nostr_dm"
+            )
+            return
+
+        # 2. Forward to cl-hive (Coordination Layer) via RPC
+        # We fire-and-forget this call to avoid blocking the inbound loop
+        # processing other messages.
+        def _forward():
+            try:
+                # Add sender context if missing
+                if "sender" not in payload:
+                    payload["sender"] = sender
+                plugin.rpc.call("hive-inject-packet", {"payload": payload, "source": "nostr"})
+            except Exception:
+                # cl-hive might not be running or RPC failed
+                pass
+        
+        threading.Thread(target=_forward, daemon=True).start()
+
+    except Exception as e:
+        _logger(f"Inbound DM error: {e}", "warn")
+
+
+def _inbound_loop() -> None:
+    """Pump inbound messages from the transport."""
+    while True:
+        try:
+            if nostr_transport:
+                nostr_transport.process_inbound()
+        except Exception as e:
+            _logger(f"Inbound loop error: {e}", "warn")
+        time.sleep(0.1)
+
+
 @plugin.init()
 def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin, **kwargs: Any) -> None:
     del kwargs
@@ -139,6 +203,17 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
             default_relays=relays,
             policy_preset=preset,
         )
+        
+        # Initialize Nostr Transport
+        global nostr_transport
+        privkey = store.get_nostr_state("config:privkey")
+        nostr_transport = NostrTransport(plugin, store, privkey_hex=privkey, relays=relays)
+        nostr_transport.receive_dm(_handle_inbound_dm)
+        nostr_transport.start()
+        
+        # Start inbound pump thread
+        threading.Thread(target=_inbound_loop, daemon=True, name="comms-inbound-pump").start()
+
         rune_verifier = RuneVerifier(
             store=store,
             rpc=plugin.rpc,
@@ -170,6 +245,35 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         f"rune_required={rune_required}, nostr_allow_plaintext={nostr_allow_plaintext}, "
         f"relays={','.join(relays)})"
     )
+
+
+def _require_nostr() -> NostrTransport:
+    if nostr_transport is None:
+        raise RuntimeError("nostr_transport not initialized")
+    return nostr_transport
+
+
+@plugin.method("hive-comms-send-dm")
+def hive_comms_send_dm(plugin: Plugin, recipient: str, message: str) -> Dict[str, Any]:
+    """Send a Nostr DM via the comms transport."""
+    del plugin
+    try:
+        return _require_nostr().send_dm(recipient_pubkey=recipient, plaintext=message)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@plugin.method("hive-comms-publish-event")
+def hive_comms_publish_event(plugin: Plugin, event_json: str) -> Dict[str, Any]:
+    """Publish a raw Nostr event."""
+    del plugin
+    try:
+        event = _parse_json_object(event_json)
+        if event is None:
+            return {"error": "event_json must be valid JSON"}
+        return _require_nostr().publish(event)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @plugin.method("hive-client-status")

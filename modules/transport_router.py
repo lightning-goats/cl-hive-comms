@@ -403,6 +403,11 @@ class TransportRouter:
         if not self._check_schema_permission(schema_type, permissions):
             return {"error": "insufficient permissions for schema", "transport": transport_name}
 
+        # Consume nonce BEFORE policy evaluation to prevent replay attacks on the policy engine
+        # (e.g. flooding the operator with confirmation alerts by replaying a high-danger request)
+        if not self.replay_guard.validate_and_update(sender_id, nonce, now_ts):
+            return {"error": "replay rejected: nonce not monotonic", "transport": transport_name}
+
         danger = self._danger_for_schema(schema_type, schema_payload)
         if danger >= 5 and not self.high_danger_limiter.check(sender_id, float(now_ts)):
             return {"error": "rate limit exceeded for high-danger operation", "transport": transport_name}
@@ -415,10 +420,6 @@ class TransportRouter:
                 "requires_confirmation": True,
                 "transport": transport_name,
             }
-
-        # Consume nonce only after policy evaluation passes (avoids burning nonces on rejected requests)
-        if not self.replay_guard.validate_and_update(sender_id, nonce, now_ts):
-            return {"error": "replay rejected: nonce not monotonic", "transport": transport_name}
 
         result = self.service.execute_schema(schema_type=schema_type, schema_payload=schema_payload)
         if isinstance(result, dict) and "error" in result:

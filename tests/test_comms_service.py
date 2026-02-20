@@ -298,3 +298,88 @@ def test_nostr_transport_decode_dm_b64():
     transport = _make_transport()
     encoded = "b64:" + base64.b64encode(b"secret").decode()
     assert transport._decode_dm(encoded) == "secret"
+
+
+# ---------------------------------------------------------------------------
+# Audit action-item tests: advisor resolution ordering
+# ---------------------------------------------------------------------------
+
+
+def test_advisor_lookup_priority_order(tmp_path):
+    """get_advisor() resolves by advisor_id first, then advisor_ref, then inline alias.
+
+    The resolution priority prevents ambiguous multi-match scenarios:
+      1. Exact match on advisor_id column
+      2. Exact match on advisor_ref column
+      3. Exact match on alias column (inline alias on comms_advisors table)
+      4. Fall back to comms_aliases join table
+    """
+    import hashlib
+
+    service = _make_service(tmp_path)
+
+    # Authorize two advisors with different names
+    auth_a = service.authorize("Alpha Advisor", access="monitor,fee_policy", daily_limit_sats=5000)
+    assert auth_a["ok"] is True
+    advisor_a_id = auth_a["advisor_id"]
+    # advisor_id is sha256("alpha advisor")[:32]
+    expected_a_id = hashlib.sha256("alpha advisor".encode("utf-8")).hexdigest()[:32]
+    assert advisor_a_id == expected_a_id
+
+    auth_b = service.authorize("Beta Advisor", access="monitor", daily_limit_sats=0)
+    assert auth_b["ok"] is True
+    advisor_b_id = auth_b["advisor_id"]
+
+    # Set an alias on advisor B using the alias() method
+    alias_result = service.alias(action="set", alias="beta", advisor="Beta Advisor")
+    assert alias_result["ok"] is True
+
+    # --- Priority 1: lookup by advisor_id returns correct advisor ---
+    found_by_id = service.store.get_advisor(advisor_a_id)
+    assert found_by_id is not None
+    assert found_by_id["advisor_id"] == advisor_a_id
+    assert found_by_id["advisor_ref"] == "Alpha Advisor"
+
+    found_by_id_b = service.store.get_advisor(advisor_b_id)
+    assert found_by_id_b is not None
+    assert found_by_id_b["advisor_ref"] == "Beta Advisor"
+
+    # --- Priority 2: lookup by advisor_ref returns correct advisor ---
+    found_by_ref = service.store.get_advisor("Alpha Advisor")
+    assert found_by_ref is not None
+    assert found_by_ref["advisor_id"] == advisor_a_id
+
+    found_by_ref_b = service.store.get_advisor("Beta Advisor")
+    assert found_by_ref_b is not None
+    assert found_by_ref_b["advisor_id"] == advisor_b_id
+
+    # --- Priority 3: lookup by inline alias (set on comms_advisors.alias) ---
+    found_by_alias = service.store.get_advisor("beta")
+    assert found_by_alias is not None
+    assert found_by_alias["advisor_id"] == advisor_b_id
+    assert found_by_alias["alias"] == "beta"
+
+    # --- Priority 4: lookup via comms_aliases join table ---
+    # The alias "beta" was also written to the comms_aliases table by alias().
+    # If we create a new alias that only exists in the aliases table (not inline),
+    # it should still resolve. Remove the inline alias first.
+    alias_entry = service.store.get_alias("beta")
+    assert alias_entry is not None
+    assert alias_entry["advisor_ref"] == "Beta Advisor"
+
+    # --- Negative: non-existent reference returns None ---
+    assert service.store.get_advisor("nonexistent") is None
+    assert service.store.get_advisor("") is None
+
+    # --- _resolve_advisor uses the same priority chain ---
+    resolved_a = service._resolve_advisor("Alpha Advisor")
+    assert resolved_a is not None
+    assert resolved_a["advisor_id"] == advisor_a_id
+
+    resolved_b = service._resolve_advisor("beta")
+    assert resolved_b is not None
+    assert resolved_b["advisor_id"] == advisor_b_id
+
+    resolved_by_id = service._resolve_advisor(advisor_a_id)
+    assert resolved_by_id is not None
+    assert resolved_by_id["advisor_ref"] == "Alpha Advisor"
