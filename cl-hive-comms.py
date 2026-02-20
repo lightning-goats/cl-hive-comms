@@ -5,9 +5,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from typing import Any, Dict
+
+# Ensure this script's real directory is on sys.path so that `from modules.X`
+# works even when CLN loads the plugin via a symlink in the plugins directory.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from pyln.client import Plugin
 
