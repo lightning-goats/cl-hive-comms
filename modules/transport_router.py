@@ -50,10 +50,15 @@ class ReplayGuard:
             raise
 
     def cleanup_stale(self, max_age_seconds: int = 86400, now_ts: int = 0) -> int:
+        if now_ts <= 0:
+            now_ts = int(time.time())
+        cutoff = now_ts - max_age_seconds
+        if cutoff < 0:
+            return 0
         conn = self.store.get_connection()
         cursor = conn.execute(
             "DELETE FROM nostr_state WHERE key LIKE 'replay:%' AND updated_at < ?",
-            (now_ts - max_age_seconds,),
+            (cutoff,),
         )
         return cursor.rowcount
 

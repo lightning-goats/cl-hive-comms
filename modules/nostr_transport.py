@@ -236,7 +236,8 @@ class NostrTransport:
             return content
         try:
             return base64.b64decode(content[4:].encode("ascii")).decode("utf-8")
-        except Exception:
+        except Exception as exc:
+            self._log(f"DM decode failed: {type(exc).__name__}: {exc}", level="warn")
             return ""
 
     def subscribe(self, filters: Dict[str, Any],

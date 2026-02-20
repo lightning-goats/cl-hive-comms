@@ -213,6 +213,10 @@ def init(options: Dict[str, Any], configuration: Dict[str, Any], plugin: Plugin,
         # Initialize Nostr Transport
         global nostr_transport
         privkey = store.get_nostr_state("config:privkey")
+        if not privkey:
+            # Identity not yet bootstrapped — bootstrap creates it, then re-read
+            service._bootstrap_identity_if_needed()
+            privkey = store.get_nostr_state("config:privkey") or ""
         nostr_transport = NostrTransport(plugin, store, privkey_hex=privkey, relays=relays)
         nostr_transport.receive_dm(_handle_inbound_dm)
         nostr_transport.start()
