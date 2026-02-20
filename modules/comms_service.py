@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -12,6 +13,14 @@ import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional
+
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
+from nacl.secret import SecretBox
+from nacl.utils import random as nacl_random
+
+# Secp256k1 curve order for key negation (BIP-340)
+_SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
 def _sha256_hex(value: str) -> str:
@@ -45,13 +54,66 @@ def _parse_json_object(raw: str) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
+class SecretManager:
+    """Manages at-rest encryption for sensitive fields."""
+
+    def __init__(self, secrets_path: str):
+        self.secrets_path = secrets_path
+        self._box: Optional[SecretBox] = None
+        self._load_or_create_key()
+
+    def _load_or_create_key(self) -> None:
+        if os.path.exists(self.secrets_path):
+            with open(self.secrets_path, "rb") as f:
+                key = f.read()
+        else:
+            key = nacl_random(32)
+            os.makedirs(os.path.dirname(self.secrets_path), mode=0o700, exist_ok=True)
+            with open(self.secrets_path, "wb") as f:
+                f.write(key)
+            os.chmod(self.secrets_path, 0o400)
+        
+        if len(key) != 32:
+            raise ValueError(f"invalid secret key length in {self.secrets_path}")
+        self._box = SecretBox(key)
+
+    def encrypt(self, plaintext: str) -> str:
+        if not self._box:
+            raise RuntimeError("SecretManager not initialized")
+        encrypted = self._box.encrypt(plaintext.encode("utf-8"))
+        return base64.b64encode(encrypted).decode("ascii")
+
+    def decrypt(self, ciphertext: str) -> str:
+        if not self._box:
+            raise RuntimeError("SecretManager not initialized")
+        try:
+            raw = base64.b64decode(ciphertext)
+            decrypted = self._box.decrypt(raw)
+            return decrypted.decode("utf-8")
+        except Exception:
+            # If decryption fails (e.g. legacy plaintext data), return as-is or raise
+            # For backward compatibility during migration, we might return the input
+            # if it looks like hex/plaintext, but secure default is to fail.
+            # Here we assume all data accessed via this method IS encrypted.
+            raise ValueError("decryption failed")
+
+    def decrypt_optional(self, ciphertext: str) -> str:
+        """Decrypts if possible, otherwise returns original (migration helper)."""
+        try:
+            return self.decrypt(ciphertext)
+        except (ValueError, TypeError, base64.binascii.Error):
+            return ciphertext
+
+
 class CommsStore:
     """SQLite persistence for cl-hive-comms local state."""
 
     def __init__(self, db_path: str, logger: Optional[Callable[[str, str], None]] = None):
         self.db_path = os.path.expanduser(db_path)
+        self.secrets_path = os.path.join(os.path.dirname(self.db_path), "comms.secrets")
         self._logger = logger
         self._local = threading.local()
+        self.secrets = SecretManager(self.secrets_path)
 
     def _log(self, message: str, level: str = "info") -> None:
         if self._logger:
@@ -62,7 +124,7 @@ class CommsStore:
         if conn is None:
             db_dir = os.path.dirname(self.db_path)
             if db_dir:
-                os.makedirs(db_dir, exist_ok=True)
+                os.makedirs(db_dir, mode=0o700, exist_ok=True)
             conn = sqlite3.connect(
                 self.db_path,
                 isolation_level=None,
@@ -77,6 +139,10 @@ class CommsStore:
             except OSError:
                 pass
         return conn
+
+    def get_connection(self) -> "sqlite3.Connection":
+        """Public accessor for thread-local DB connection (used by ReplayGuard)."""
+        return self._get_connection()
 
     def close(self) -> None:
         conn = getattr(self._local, "conn", None)
@@ -208,9 +274,14 @@ class CommsStore:
             "SELECT value FROM nostr_state WHERE key = ?",
             (key,),
         ).fetchone()
-        return str(row["value"]) if row else None
+        val = str(row["value"]) if row else None
+        if val and key == "config:privkey":
+            return self.secrets.decrypt_optional(val)
+        return val
 
     def set_nostr_state(self, key: str, value: str, now_ts: int) -> None:
+        if key == "config:privkey":
+            value = self.secrets.encrypt(value)
         conn = self._get_connection()
         conn.execute(
             """
@@ -282,16 +353,16 @@ class CommsStore:
 
     def get_advisor(self, reference: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
-        row = conn.execute(
-            """
-            SELECT * FROM comms_advisors
-            WHERE advisor_id = ? OR advisor_ref = ? OR alias = ?
-            LIMIT 1
-            """,
-            (reference, reference, reference),
-        ).fetchone()
-        if row:
-            return dict(row)
+        # Priority order: exact advisor_id > exact advisor_ref > inline alias
+        # This prevents ambiguous multi-match scenarios.
+        for column in ("advisor_id", "advisor_ref", "alias"):
+            row = conn.execute(
+                f"SELECT * FROM comms_advisors WHERE {column} = ? LIMIT 1",
+                (reference,),
+            ).fetchone()
+            if row:
+                return dict(row)
+        # Fall back to alias table join
         alias_row = conn.execute(
             """
             SELECT a.*
@@ -374,9 +445,11 @@ class CommsStore:
             "SELECT auth_token FROM comms_advisor_auth WHERE advisor_id = ?",
             (advisor_id,),
         ).fetchone()
-        return str(row["auth_token"]) if row else None
+        val = str(row["auth_token"]) if row else None
+        return self.secrets.decrypt_optional(val) if val else None
 
     def upsert_advisor_auth_token(self, advisor_id: str, auth_token: str, now_ts: int) -> None:
+        encrypted_token = self.secrets.encrypt(auth_token)
         conn = self._get_connection()
         existing = conn.execute(
             "SELECT created_at FROM comms_advisor_auth WHERE advisor_id = ?",
@@ -391,8 +464,12 @@ class CommsStore:
                 auth_token = excluded.auth_token,
                 updated_at = excluded.updated_at
             """,
-            (advisor_id, auth_token, created_at, now_ts),
+            (advisor_id, encrypted_token, created_at, now_ts),
         )
+
+    def delete_advisor_auth_token(self, advisor_id: str) -> None:
+        conn = self._get_connection()
+        conn.execute("DELETE FROM comms_advisor_auth WHERE advisor_id = ?", (advisor_id,))
 
     def get_alias(self, alias: str) -> Optional[Dict[str, Any]]:
         conn = self._get_connection()
@@ -548,6 +625,15 @@ class CommsStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def sum_payments_today(self, advisor_id: str, now_ts: int) -> int:
+        conn = self._get_connection()
+        day_start = now_ts - 86400
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount_sats), 0) AS total FROM comms_payments WHERE advisor_id = ? AND created_at >= ?",
+            (advisor_id, day_start),
+        ).fetchone()
+        return int(row["total"] or 0)
+
     def summarize_payments(self, now_ts: int) -> Dict[str, int]:
         conn = self._get_connection()
         day_cutoff = now_ts - 86400
@@ -685,6 +771,38 @@ class CommsStore:
         conn = self._get_connection()
         row = conn.execute("SELECT COUNT(*) AS cnt FROM management_receipts").fetchone()
         return int(row["cnt"] or 0)
+
+    def prune_old_data(self, days: int = 90, now_ts: int = 0) -> Dict[str, int]:
+        conn = self._get_connection()
+        if now_ts <= 0:
+            now_ts = _now_ts(time.time)
+        cutoff = now_ts - (days * 86400)
+        pruned: Dict[str, int] = {}
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "DELETE FROM management_receipts WHERE created_at < ?", (cutoff,)
+            )
+            pruned["receipts"] = cursor.rowcount
+            cursor = conn.execute(
+                "DELETE FROM comms_payments WHERE created_at < ?", (cutoff,)
+            )
+            pruned["payments"] = cursor.rowcount
+            cursor = conn.execute(
+                "DELETE FROM comms_trials WHERE status IN ('expired', 'stopped') AND ends_at < ?",
+                (cutoff,),
+            )
+            pruned["trials"] = cursor.rowcount
+            cursor = conn.execute(
+                "DELETE FROM nostr_state WHERE key LIKE 'replay:%' AND updated_at < ?",
+                (cutoff,),
+            )
+            pruned["replay_nonces"] = cursor.rowcount
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return pruned
 
 
 class PolicyEngine:
@@ -851,11 +969,22 @@ class CommsService:
         return _now_ts(self._time_fn)
 
     def _create_local_identity(self) -> Dict[str, str]:
-        privkey = secrets.token_hex(32)
-        digest = _sha256_hex(privkey)
-        # Nostr uses x-only 32-byte pubkeys.
-        pubkey = digest[:64]
-        return {"privkey": privkey, "pubkey": pubkey}
+        # Generate a secure secp256k1 private key
+        private_key = ec.generate_private_key(ec.SECP256K1())
+        private_val = private_key.private_numbers().private_value
+        public_nums = private_key.public_key().public_numbers()
+
+        # Enforce even Y coordinate (BIP-340 / Nostr)
+        if public_nums.y % 2 != 0:
+            private_val = _SECP256K1_ORDER - private_val
+            # Recompute pubkey from negated key so privkey/pubkey stay consistent
+            negated_key = ec.derive_private_key(private_val, ec.SECP256K1())
+            public_nums = negated_key.public_key().public_numbers()
+
+        privkey_hex = format(private_val, "064x")
+        pubkey_hex = format(public_nums.x, "064x")
+        
+        return {"privkey": privkey_hex, "pubkey": pubkey_hex, "placeholder": False}
 
     def _bootstrap_identity_if_needed(self) -> None:
         now_ts = self._now()
@@ -866,7 +995,8 @@ class CommsService:
             identity = self._create_local_identity()
             self.store.set_nostr_state("config:privkey", identity["privkey"], now_ts)
             self.store.set_nostr_state("config:pubkey", identity["pubkey"], now_ts)
-            self._log("comms: generated local Nostr identity", "info")
+            self.store.set_nostr_state("config:identity_placeholder", "true", now_ts)
+            self._log("comms: generated placeholder Nostr identity (not valid for external relay publishing)", "warn")
         elif _is_hex_len(pubkey, 66) and pubkey[:2] in ("02", "03"):
             # Migrate old compressed-style placeholder key to x-only form.
             self.store.set_nostr_state("config:pubkey", pubkey[2:], now_ts)
@@ -895,11 +1025,13 @@ class CommsService:
             return None
         return self.store.get_advisor(reference.strip())
 
+    VALID_PERMISSIONS = {"monitor", "admin", "policy", "payments", "payment", "fee_policy", "trial", "alias"}
+
     def _to_permissions(self, access: str) -> List[str]:
         if not isinstance(access, str):
             return ["monitor"]
         items = [item.strip() for item in access.split(",")]
-        cleaned = [item for item in items if item]
+        cleaned = [item for item in items if item and item in self.VALID_PERMISSIONS]
         return cleaned or ["monitor"]
 
     def _to_int(self, value: Any, default: int) -> int:
@@ -949,22 +1081,26 @@ class CommsService:
 
         if action in ("get", "status", "show"):
             pubkey = self.store.get_nostr_state("config:pubkey") or ""
+            is_placeholder = self.store.get_nostr_state("config:identity_placeholder") == "true"
             return {
                 "ok": True,
                 "pubkey": pubkey,
                 "relays": self._get_relays(),
                 "has_private_key": bool(self.store.get_nostr_state("config:privkey")),
+                "placeholder_keygen": is_placeholder,
             }
 
         if action == "rotate":
             identity = self._create_local_identity()
             self.store.set_nostr_state("config:privkey", identity["privkey"], now_ts)
             self.store.set_nostr_state("config:pubkey", identity["pubkey"], now_ts)
+            self.store.set_nostr_state("config:identity_placeholder", "true", now_ts)
             return {
                 "ok": True,
                 "rotated": True,
                 "pubkey": identity["pubkey"],
                 "relays": self._get_relays(),
+                "placeholder_keygen": True,
             }
 
         if action == "import":
@@ -974,10 +1110,18 @@ class CommsService:
                     "error": "invalid nsec format",
                     "hint": "expected 64-char hex private key for current dark-launch mode",
                 }
-            digest = _sha256_hex(key)
-            pubkey = digest[:64]
+            try:
+                priv_val = int(key, 16)
+                if not (1 <= priv_val < _SECP256K1_ORDER):
+                    return {"error": "invalid private key: value out of secp256k1 range"}
+                private_key = ec.derive_private_key(priv_val, ec.SECP256K1())
+                public_nums = private_key.public_key().public_numbers()
+                pubkey = format(public_nums.x, "064x")
+            except Exception:
+                return {"error": "invalid private key: secp256k1 derivation failed"}
             self.store.set_nostr_state("config:privkey", key, now_ts)
             self.store.set_nostr_state("config:pubkey", pubkey, now_ts)
+            self.store.set_nostr_state("config:identity_placeholder", "false", now_ts)
             return {"ok": True, "imported": True, "pubkey": pubkey, "relays": self._get_relays()}
 
         if action == "set-relays":
@@ -1028,12 +1172,13 @@ class CommsService:
             "daily_limit_sats": max(0, int(daily_limit_sats)),
             "auth_token": auth_token,
         }
+        receipt_result = {k: v for k, v in result.items() if k != "auth_token"}
         receipt = self._record_receipt(
             actor=advisor_id,
             schema_id="hive:authorize/v1",
             action="authorize",
             params={"access": permissions, "daily_limit_sats": max(0, int(daily_limit_sats))},
-            result=result,
+            result=receipt_result,
         )
         result["receipt_id"] = receipt["receipt_id"]
         return result
@@ -1052,6 +1197,7 @@ class CommsService:
             note=str(reason or row.get("note") or ""),
             now_ts=self._now(),
         )
+        self.store.delete_advisor_auth_token(advisor_id)
         result = {
             "ok": True,
             "advisor_id": advisor_id,
@@ -1185,6 +1331,16 @@ class CommsService:
             if not row:
                 return {"error": "advisor not found"}
             advisor_id = str(row.get("advisor_id") or "")
+            daily_limit = int(row.get("daily_limit_sats") or 0)
+            if daily_limit > 0:
+                spent_today = self.store.sum_payments_today(advisor_id, now_ts)
+                if spent_today + amount_sats > daily_limit:
+                    return {
+                        "error": "daily limit exceeded",
+                        "daily_limit_sats": daily_limit,
+                        "spent_today_sats": spent_today,
+                        "requested_sats": amount_sats,
+                    }
             payment_id = _sha256_hex(f"{advisor_id}:{method}:{amount_sats}:{now_ts}:{uuid.uuid4()}")[:32]
             self.store.add_payment(
                 payment_id=payment_id,
@@ -1330,6 +1486,14 @@ class CommsService:
             return {"ok": True, "removed": removed}
 
         return {"error": "invalid action", "valid_actions": ["list", "set", "get", "remove"]}
+
+    def prune(self, days: int = 90) -> Dict[str, Any]:
+        if not isinstance(days, int) or days < 1:
+            return {"error": "days must be a positive integer"}
+        if days > 365:
+            days = 365
+        pruned = self.store.prune_old_data(days=days, now_ts=self._now())
+        return {"ok": True, "days": days, "pruned": pruned}
 
     def execute_schema(self, schema_type: str, schema_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a transport-delivered schema payload to local handlers."""

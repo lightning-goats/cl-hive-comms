@@ -8,7 +8,7 @@ import threading
 import time
 import hashlib
 import hmac
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from modules.comms_service import CommsService, CommsStore
 from modules.transport_security import NostrDmCodec, RuneVerifier
@@ -24,7 +24,7 @@ class ReplayGuard:
 
     def validate_and_update(self, sender: str, nonce: int, now_ts: int) -> bool:
         key = f"{self.KEY_PREFIX}{sender}"
-        conn = self.store._get_connection()
+        conn = self.store.get_connection()
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
@@ -50,10 +50,15 @@ class ReplayGuard:
             raise
 
     def cleanup_stale(self, max_age_seconds: int = 86400, now_ts: int = 0) -> int:
-        conn = self.store._get_connection()
+        if now_ts <= 0:
+            now_ts = int(time.time())
+        cutoff = now_ts - max_age_seconds
+        if cutoff < 0:
+            return 0
+        conn = self.store.get_connection()
         cursor = conn.execute(
             "DELETE FROM nostr_state WHERE key LIKE 'replay:%' AND updated_at < ?",
-            (now_ts - max_age_seconds,),
+            (cutoff,),
         )
         return cursor.rowcount
 
@@ -115,6 +120,7 @@ class TransportRouter:
         self.max_clock_skew_seconds = max(1, int(max_clock_skew_seconds))
         self.replay_guard = ReplayGuard(store=store)
         self.rate_limiter = RateLimiter(max_per_window=60, window_seconds=60)
+        self.high_danger_limiter = RateLimiter(max_per_window=5, window_seconds=60)
         self._registry_lock = threading.Lock()
         self._seed_builtin_transports()
 
@@ -236,7 +242,8 @@ class TransportRouter:
             if action == "stop":
                 return 3
             return 2
-        return 6
+        # Unknown schemas get high danger score to require explicit policy allowance
+        return 9
 
     def _validate_message(self, message: Dict[str, Any]) -> Optional[str]:
         if not isinstance(message, dict):
@@ -401,10 +408,14 @@ class TransportRouter:
         if not self._check_schema_permission(schema_type, permissions):
             return {"error": "insufficient permissions for schema", "transport": transport_name}
 
+        # Consume nonce BEFORE policy evaluation to prevent replay attacks on the policy engine
+        # (e.g. flooding the operator with confirmation alerts by replaying a high-danger request)
         if not self.replay_guard.validate_and_update(sender_id, nonce, now_ts):
             return {"error": "replay rejected: nonce not monotonic", "transport": transport_name}
 
         danger = self._danger_for_schema(schema_type, schema_payload)
+        if danger >= 5 and not self.high_danger_limiter.check(sender_id, float(now_ts)):
+            return {"error": "rate limit exceeded for high-danger operation", "transport": transport_name}
         policy = self.service.policy_engine.evaluate(schema_id=schema_type, danger_score=danger)
         if not policy.get("allowed", False):
             return {"error": policy.get("reason") or "blocked by policy", "transport": transport_name}

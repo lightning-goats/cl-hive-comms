@@ -345,3 +345,40 @@ def test_oversized_message_rejected(tmp_path):
     res = router.handle_message(sender="npub1", message=msg, transport="rest")
     assert "error" in res
     assert "maximum size" in res["error"]
+
+
+def test_high_danger_rate_limit(tmp_path):
+    """High-danger operations have a stricter rate limit (5/min)."""
+    now = [time.time()]
+    service, router = _make_router(tmp_path, time_fn=lambda: now[0])
+    # Give admin permissions so authorize schema is allowed
+    auth = service.authorize("npub1", access="admin")
+    token = auth["auth_token"]
+
+    # Send 5 authorize requests (danger=8 for admin authorize)
+    for i in range(5):
+        msg = _sign_message(
+            _envelope(
+                "hive:authorize/v1",
+                {"action": "authorize", "advisor": f"test-{i}", "access": "monitor"},
+                nonce=i + 1,
+                timestamp=int(now[0]),
+            ),
+            token,
+        )
+        res = router.handle_message(sender="npub1", message=msg, transport="rest")
+        assert "rate limit" not in res.get("error", ""), f"request {i+1} unexpectedly rate limited"
+
+    # 6th high-danger request should be rate limited
+    msg = _sign_message(
+        _envelope(
+            "hive:authorize/v1",
+            {"action": "authorize", "advisor": "test-overflow", "access": "monitor"},
+            nonce=6,
+            timestamp=int(now[0]),
+        ),
+        token,
+    )
+    res = router.handle_message(sender="npub1", message=msg, transport="rest")
+    assert "error" in res
+    assert "high-danger" in res["error"]
