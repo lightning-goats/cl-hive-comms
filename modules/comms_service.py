@@ -977,6 +977,9 @@ class CommsService:
         # Enforce even Y coordinate (BIP-340 / Nostr)
         if public_nums.y % 2 != 0:
             private_val = _SECP256K1_ORDER - private_val
+            # Recompute pubkey from negated key so privkey/pubkey stay consistent
+            negated_key = ec.derive_private_key(private_val, ec.SECP256K1())
+            public_nums = negated_key.public_key().public_numbers()
 
         privkey_hex = format(private_val, "064x")
         pubkey_hex = format(public_nums.x, "064x")
@@ -1109,6 +1112,8 @@ class CommsService:
                 }
             try:
                 priv_val = int(key, 16)
+                if not (1 <= priv_val < _SECP256K1_ORDER):
+                    return {"error": "invalid private key: value out of secp256k1 range"}
                 private_key = ec.derive_private_key(priv_val, ec.SECP256K1())
                 public_nums = private_key.public_key().public_numbers()
                 pubkey = format(public_nums.x, "064x")

@@ -78,6 +78,9 @@ class NostrTransport:
         """Derive a deterministic 32-byte x-only pubkey hex from private key using cryptography."""
         try:
             priv_val = int(privkey_hex, 16)
+            if not (1 <= priv_val < _SECP256K1_ORDER):
+                self._log("pubkey derivation failed: private key out of valid range", level="error")
+                return ""
             private_key = ec.derive_private_key(priv_val, ec.SECP256K1())
             public_nums = private_key.public_key().public_numbers()
             return format(public_nums.x, "064x")

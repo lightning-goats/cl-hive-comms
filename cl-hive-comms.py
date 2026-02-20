@@ -266,7 +266,8 @@ def hive_comms_send_dm(plugin: Plugin, recipient: str, message: str) -> Dict[str
     try:
         return _require_nostr().send_dm(recipient_pubkey=recipient, plaintext=message)
     except Exception as e:
-        return {"error": str(e)}
+        _logger(f"hive-comms-send-dm error: {e}", "warn")
+        return {"error": "send_dm failed"}
 
 
 @plugin.method("hive-comms-publish-event")
@@ -279,7 +280,8 @@ def hive_comms_publish_event(plugin: Plugin, event_json: str) -> Dict[str, Any]:
             return {"error": "event_json must be valid JSON"}
         return _require_nostr().publish(event)
     except Exception as e:
-        return {"error": str(e)}
+        _logger(f"hive-comms-publish-event error: {e}", "warn")
+        return {"error": "publish failed"}
 
 
 @plugin.method("hive-client-status")
