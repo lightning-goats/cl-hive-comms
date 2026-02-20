@@ -20,6 +20,7 @@ plugin = Plugin()
 service: CommsService | None = None
 router: TransportRouter | None = None
 nostr_transport: NostrTransport | None = None
+MAX_FORWARDED_DM_BYTES = 65536
 
 
 plugin.add_option(
@@ -116,20 +117,20 @@ def _handle_inbound_dm(envelope: Dict[str, Any]) -> None:
         plaintext = envelope.get("plaintext", "")
         if not plaintext:
             return
+        if len(plaintext) > MAX_FORWARDED_DM_BYTES:
+            _logger(f"Inbound DM too large ({len(plaintext)} bytes), dropping", "warn")
+            return
+        sender = envelope.get("pubkey")
         
         # Try parsing as JSON
         try:
             payload = json.loads(plaintext)
         except json.JSONDecodeError:
-            # Not JSON, ignore or forward raw? 
-            # Hive protocol might be binary wrapped in base64? 
-            # For now assume JSON as per spec.
-            return
+            # Preserve raw plaintext for cl-hive to decode wire payloads.
+            payload = {"raw_plaintext": plaintext}
 
         if not isinstance(payload, dict):
             return
-
-        sender = envelope.get("pubkey")
 
         # 1. Check if it's a management schema (local processing)
         if "schema_type" in payload:
