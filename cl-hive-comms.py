@@ -154,7 +154,7 @@ def _handle_inbound_dm(envelope: Dict[str, Any]) -> None:
                 # Add sender context if missing
                 if "sender" not in payload:
                     payload["sender"] = sender
-                plugin.rpc.call("hive-inject-packet", {"payload": payload, "source": "nostr"})
+                plugin.rpc.call("hive-inject-packet", {"payload": payload, "source": "nostr", "pubkey": sender})
             except Exception:
                 # cl-hive might not be running or RPC failed
                 pass
