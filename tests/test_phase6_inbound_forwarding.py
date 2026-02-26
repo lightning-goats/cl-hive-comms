@@ -80,7 +80,7 @@ def test_non_json_dm_is_forwarded_as_raw_packet():
 
     module.plugin.rpc.call.assert_called_once_with(
         "hive-inject-packet",
-        {"payload": {"raw_plaintext": "not-json-wire", "sender": "peer-a"}, "source": "nostr"},
+        {"payload": {"raw_plaintext": "not-json-wire", "sender": "peer-a"}, "source": "nostr", "pubkey": "peer-a"},
     )
 
 

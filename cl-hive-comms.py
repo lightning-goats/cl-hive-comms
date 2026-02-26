@@ -154,10 +154,9 @@ def _handle_inbound_dm(envelope: Dict[str, Any]) -> None:
                 # Add sender context if missing
                 if "sender" not in payload:
                     payload["sender"] = sender
-                plugin.rpc.call("hive-inject-packet", {"payload": payload, "source": "nostr"})
-            except Exception:
-                # cl-hive might not be running or RPC failed
-                pass
+                plugin.rpc.call("hive-inject-packet", {"payload": payload, "source": "nostr", "pubkey": sender})
+            except Exception as exc:
+                _logger(f"Forward to cl-hive failed: {exc}", "debug")
         
         threading.Thread(target=_forward, daemon=True).start()
 
@@ -178,7 +177,8 @@ def _inbound_loop() -> None:
         try:
             if nostr_transport and nostr_transport._stop_event.wait(0.1):
                 break
-        except Exception:
+        except Exception as exc:
+            _logger(f"Inbound loop wait error: {exc}", "debug")
             time.sleep(0.1)
 
 

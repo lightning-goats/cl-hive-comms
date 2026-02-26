@@ -149,8 +149,8 @@ class CommsStore:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._log(f"comms: db close error: {exc}", "debug")
             self._local.conn = None
 
     def initialize(self) -> None:
@@ -880,13 +880,21 @@ class PolicyEngine:
         return self._persist(base)
 
     def update_overrides(self, overrides: Dict[str, Any]) -> Dict[str, Any]:
-        policy = self.get_policy()
-        current = policy.get("overrides", {})
-        if not isinstance(current, dict):
-            current = {}
-        current.update(overrides)
-        policy["overrides"] = current
-        return self._persist(policy)
+        conn = self.store._get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            policy = self.get_policy()
+            current = policy.get("overrides", {})
+            if not isinstance(current, dict):
+                current = {}
+            current.update(overrides)
+            policy["overrides"] = current
+            result = self._persist(policy)
+            conn.execute("COMMIT")
+            return result
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     def reset(self) -> Dict[str, Any]:
         return self.set_preset("moderate")
